@@ -1,0 +1,12 @@
+[master]
+slurm-controller ansible_host=${controller_ip}
+
+[compute]
+%{ for idx, ip in compute_ips ~}
+slurm-worker-${idx + 1} ansible_host=${ip}
+%{ endfor ~}
+
+[all:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/SLURM/terraform/Vienna
+ansible_become=yes

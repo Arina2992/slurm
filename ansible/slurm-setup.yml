@@ -1,0 +1,125 @@
+---
+- name: Настройка SLURM
+  hosts: all
+  become: yes
+  vars:
+    cluster_name: "slurm_cluster"
+    partition_name: "compute"
+    master_node: "slurm_controller"
+    compute_nodes: ["slurm_worker1", "slurm_worker2"]
+    cgroup_config:
+      mountpoint: "/sys/fs/cgroup"
+      automount: "yes"
+      allowed_devices_file: "/etc/slurm-llnl/cgroup_allowed_devices_file.conf"
+      constrain_ram: "yes"
+    allowed_devices:
+      - "/dev/null"
+      - "/dev/urandom"
+      - "/dev/zero"
+      - "/dev/nvme*"
+      - "/dev/cpu/*/*"
+      - "/dev/pts/*"
+
+  tasks:
+    - name: Обновление /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {% for host in groups['all'] %}
+          {{ hostvars[host].ansible_host }} {{ host }}
+          {% endfor %}
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - SLURM NODES"
+
+    - name: Установка NTP для синхронизации времени
+      apt:
+        name: chrony
+        state: present
+      notify: restart chrony
+
+    - name: Установка зависимостей
+      apt:
+        name:
+          - wget
+          - build-essential
+          - hwloc
+          - libhwloc-dev
+          - libmunge-dev
+        state: present
+
+- name: Настройка master-узла
+  hosts: master
+  tasks:
+    - name: Установка SLURM и Munge
+      apt:
+        name:
+          - slurm-wlm
+          - slurmctld
+          - munge
+        state: present
+
+    - name: Генерация Munge key
+      command: /usr/sbin/create-munge-key
+      args:
+        creates: /etc/munge/munge.key
+
+    - name: Копирование Munge key в shared storage
+      copy:
+        src: /etc/munge/munge.key
+        dest: /shared/munge.key
+        owner: munge
+        group: munge
+        mode: '0600'
+
+    - name: Создание конфига SLURM
+      template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm-llnl/slurm.conf
+        mode: '0644'
+
+    - name: Запуск slurmctld и munge
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - munge
+        - slurmctld
+
+- name: Настройка compute-узлов
+  hosts: compute
+  tasks:
+    - name: Установка SLURM client
+      apt:
+        name:
+          - slurmd
+          - munge
+        state: present
+
+    - name: Копирование Munge key с master
+      copy:
+        src: /shared/munge.key
+        dest: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0600'
+
+    - name: Копирование slurm.conf
+      copy:
+        src: /shared/slurm.conf
+        dest: /etc/slurm-llnl/slurm.conf
+        mode: '0644'
+
+    - name: Запуск slurmd и munge
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - munge
+        - slurmd
+
+  handlers:
+    - name: restart chrony
+      service:
+        name: chrony
+        state: restarted

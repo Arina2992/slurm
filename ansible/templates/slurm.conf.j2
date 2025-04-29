@@ -1,0 +1,30 @@
+ClusterName={{ cluster_name }}
+SlurmctldHost={{ master_node }}({{ hostvars[master_node].ansible_host }})
+SlurmctldPort=6817
+SlurmdPort=6818
+AuthType=auth/munge
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+SwitchType=switch/none
+MpiDefault=none
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmdPidFile=/var/run/slurmd.pid
+ProctrackType=proctrack/cgroup
+CacheGroups=0
+ReturnToService=0
+SlurmctldTimeout=300
+SlurmdTimeout=300
+InactiveLimit=0
+MinJobAge=300
+KillWait=30
+Waittime=0
+SelectType=select/cons_res
+SelectTypeParameters=CR_Core
+
+# Compute Nodes
+{% for node in compute_nodes %}
+NodeName={{ node }} NodeAddr={{ hostvars[node].ansible_host }} CPUs={{ ansible_processor_cores }} State=UNKNOWN
+{% endfor %}
+
+# Partition
+PartitionName={{ partition_name }} Nodes={{ compute_nodes|join(',') }} Default=YES MaxTime=INFINITE State=UP
