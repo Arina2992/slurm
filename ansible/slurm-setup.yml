@@ -1,125 +1,238 @@
 ---
-- name: Настройка SLURM
+- name: Configure SLURM cluster
   hosts: all
   become: yes
   vars:
-    cluster_name: "slurm_cluster"
-    partition_name: "compute"
-    master_node: "slurm_controller"
-    compute_nodes: ["slurm_worker1", "slurm_worker2"]
-    cgroup_config:
-      mountpoint: "/sys/fs/cgroup"
-      automount: "yes"
-      allowed_devices_file: "/etc/slurm-llnl/cgroup_allowed_devices_file.conf"
-      constrain_ram: "yes"
-    allowed_devices:
-      - "/dev/null"
-      - "/dev/urandom"
-      - "/dev/zero"
-      - "/dev/nvme*"
-      - "/dev/cpu/*/*"
-      - "/dev/pts/*"
+    cluster_name: slurm
+    controller_hostname: slurm-controller
+    compute_nodes:
+      - slurm-compute1
+      - slurm-compute2
+    network_prefix: "192.168.0"
+    controller_ip: "{{ network_prefix }}.10"
+    compute_ips:
+      slurm-compute1: "{{ network_prefix }}.11"
+      slurm-compute2: "{{ network_prefix }}.12"
 
   tasks:
-    - name: Обновление /etc/hosts
-      blockinfile:
-        path: /etc/hosts
-        block: |
-          {% for host in groups['all'] %}
-          {{ hostvars[host].ansible_host }} {{ host }}
-          {% endfor %}
-        marker: "# {mark} ANSIBLE MANAGED BLOCK - SLURM NODES"
+    - name: Update /etc/hosts on all nodes
+      block:
+        - name: Ensure /etc/hosts contains controller entry
+          lineinfile:
+            path: /etc/hosts
+            line: "{{ controller_ip }} {{ controller_hostname }}"
+            state: present
+        - name: Ensure /etc/hosts contains compute node entries
+          lineinfile:
+            path: /etc/hosts
+            line: "{{ compute_ips[item]}} {{ item }}"
+            state: present
+          loop: "{{ compute_nodes }}"
 
-    - name: Установка NTP для синхронизации времени
+    - name: Test connectivity with ping
+      ansible.builtin.ping:
+
+    - name: Update apt cache
       apt:
-        name: chrony
-        state: present
-      notify: restart chrony
+        update_cache: yes
+      changed_when: false
 
-    - name: Установка зависимостей
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+
+- name: Configure MUNGE on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install MUNGE packages
       apt:
         name:
-          - wget
-          - build-essential
-          - hwloc
-          - libhwloc-dev
+          - munge
+          - libmunge2
           - libmunge-dev
         state: present
 
-- name: Настройка master-узла
-  hosts: master
-  tasks:
-    - name: Установка SLURM и Munge
-      apt:
-        name:
-          - slurm-wlm
-          - slurmctld
-          - munge
-        state: present
+    - name: Verify MUNGE installation
+      command: munge -n | unmunge | grep STATUS
+      register: munge_status
+      changed_when: false
+      failed_when: "'SUCCESS' not in munge_status.stdout"
 
-    - name: Генерация Munge key
-      command: /usr/sbin/create-munge-key
+- name: Configure MUNGE on controller
+  hosts: slurm-controller
+  become: yes
+  tasks:
+    - name: Generate MUNGE key on controller
+      command: /usr/sbin/create-munge-key -f
       args:
         creates: /etc/munge/munge.key
 
-    - name: Копирование Munge key в shared storage
-      copy:
-        src: /etc/munge/munge.key
-        dest: /shared/munge.key
+    - name: Set MUNGE directory permissions
+      file:
+        path: "{{ item }}"
         owner: munge
         group: munge
-        mode: '0600'
-
-    - name: Создание конфига SLURM
-      template:
-        src: templates/slurm.conf.j2
-        dest: /etc/slurm-llnl/slurm.conf
-        mode: '0644'
-
-    - name: Запуск slurmctld и munge
-      service:
-        name: "{{ item }}"
-        state: started
-        enabled: yes
+        mode: "0700"
       loop:
-        - munge
-        - slurmctld
+        - /etc/munge
+        - /var/log/munge
+        - /var/lib/munge
 
-- name: Настройка compute-узлов
-  hosts: compute
+    - name: Set MUNGE run directory permissions
+      file:
+        path: /run/munge
+        owner: munge
+        group: munge
+        mode: "0755"
+
+    - name: Set MUNGE key permissions
+      file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: "0700"
+
+    - name: Enable and restart MUNGE service
+      systemd:
+        name: munge
+        enabled: yes
+        state: restarted
+
+    - name: Check MUNGE service status
+      command: systemctl status munge
+      changed_when: false
+      register: munge_service_status
+      failed_when: "'active (running)' not in munge_service_status.stdout"
+
+    - name: Copy MUNGE key to compute nodes
+      command: scp /etc/munge/munge.key root@{{ compute_ips[item] }}:/etc/munge/
+      loop: "{{ compute_nodes }}"
+      delegate_to: "{{ controller_hostname }}"
+
+- name: Configure MUNGE on compute nodes
+  hosts: slurm-compute*
+  become: yes
   tasks:
-    - name: Установка SLURM client
+    - name: Set MUNGE directory permissions
+      file:
+        path: "{{ item }}"
+        owner: munge
+        group: munge
+        mode: "0700"
+      loop:
+        - /etc/munge
+        - /var/log/munge
+        - /var/lib/munge
+
+    - name: Set MUNGE run directory permissions
+      file:
+        path: /run/munge
+        owner: munge
+        group: munge
+        mode: "0755"
+
+    - name: Set MUNGE key permissions
+      file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: "0700"
+
+    - name: Enable and restart MUNGE service
+      systemd:
+        name: munge
+        enabled: yes
+        state: restarted
+
+    - name: Check MUNGE service status
+      command: systemctl status munge
+      changed_when: false
+      register: munge_service_status
+      failed_when: "'active (running)' not in munge_service_status.stdout"
+
+    - name: Verify MUNGE key connectivity
+      command: munge -n | ssh {{ controller_hostname }} unmunge
+      register: munge_connectivity
+      changed_when: false
+      failed_when: "'SUCCESS' not in munge_connectivity.stdout"
+
+    - name: Install SLURM packages
       apt:
-        name:
-          - slurmd
-          - munge
+        name: slurm-wlm
         state: present
 
-    - name: Копирование Munge key с master
+- name: Configure SLURM on controller
+  hosts: slurm-controller
+  become: yes
+  tasks:
+    - name: Copy SLURM configurator file
       copy:
-        src: /shared/munge.key
-        dest: /etc/munge/munge.key
-        owner: munge
-        group: munge
-        mode: '0600'
+        src: /usr/share/doc/slurmctld/slurm-wlm-configurator.html
+        dest: /tmp/slurm-wlm-configurator.html
+        mode: "0644"
+        remote_src: yes
 
-    - name: Копирование slurm.conf
+    - name: Create SLURM configuration file
       copy:
-        src: /shared/slurm.conf
-        dest: /etc/slurm-llnl/slurm.conf
-        mode: '0644'
+        content: |
+          ClusterName={{ cluster_name }}
+          SlurmctldHost={{ controller_hostname }}
+          NodeName={{ compute_nodes | join(',') }} CPUs=4 Sockets=2 CoresPerSocket=2 ThreadsPerCore=1
+          PartitionName=debug Nodes={{ compute_nodes | join(',') }} Default=YES MaxTime=INFINITE State=UP
+          ControlMachine={{ controller_hostname }}
+          AuthType=auth/munge
+          JobAcctGatherType=jobacct_gather/linux
+          SlurmctldPidFile=/var/run/slurmctld.pid
+          SlurmdPidFile=/var/run/slurmd.pid
+          SlurmUser=slurm
+          StateSaveLocation=/var/spool/slurm
+          SlurmdSpoolDir=/var/spool/slurmd
+          TaskPlugin=task/affinity
+          ProctrackType=proctrack/linuxproc
+        dest: /etc/slurm/slurm.conf
+        owner: root
+        group: root
+        mode: "0644"
 
-    - name: Запуск slurmd и munge
-      service:
-        name: "{{ item }}"
-        state: started
+    - name: Enable and restart slurmctld service
+      systemd:
+        name: slurmctld
         enabled: yes
-      loop:
-        - munge
-        - slurmd
-
-  handlers:
-    - name: restart chrony
-      service:
-        name: chrony
         state: restarted
+
+    - name: Check slurmctld service status
+      command: systemctl status slurmctld
+      changed_when: false
+      register: slurmctld_status
+      failed_when: "'active (running)' not in slurmctld_status.stdout"
+
+    - name: Verify SLURM cluster status
+      command: sinfo
+      register: sinfo_output
+      changed_when: false
+
+- name: Configure SLURM on compute nodes
+  hosts: slurm-compute*
+  become: yes
+  tasks:
+    - name: Copy SLURM configuration from controller
+      synchronize:
+        src: /etc/slurm/slurm.conf
+        dest: /etc/slurm/slurm.conf
+        mode: pull
+      delegate_to: "{{ controller_hostname }}"
+
+    - name: Enable and restart slurmd service
+      systemd:
+        name: slurmd
+        enabled: yes
+        state: restarted
+
+    - name: Check slurmd service status
+      command: systemctl status slurmd
+      changed_when: false
+      register: slurmd_status
+      failed_when: "'active (running)' not in slurmd_status.stdout"
